@@ -6,54 +6,35 @@
 
 #define PIPE_TIMEOUT 5000
 #define BUFSIZE 65535
-#define INSTANCES 32
-#define MAXRETRY 120
-#define RETRY_WAIT 500 // ms
+#define INSTANCES 64
 
-enum CallbackType {
-	ePipe,
-	eSock
-};
-
-struct PipeInst;
-
-typedef struct CallbackParam {
-	PipeInst* inst;
-	CallbackType type;
-} CALLBACKPARAM, *LPCALLBACKPARAM;
-
-enum State {
-	eIdle,
-	eRead,
-	eWrite,
-};
-
-typedef struct PipeInst {
-	OVERLAPPED readOverlap;
-	OVERLAPPED writeOverlap;
-
+typedef struct ConnInst {
 	HANDLE pipe;
 	LPPROXY proxy;
 
-	State requestState;
-	State responseState;
+	BOOL closed;
 
+	OVERLAPPED readOverlap;
 	CHAR readBuf[BUFSIZE];
 	DWORD bytesRead;
+
+	OVERLAPPED writeOverlap;
 	CHAR writeBuf[BUFSIZE];
 	DWORD bytesWrite;
 	DWORD bytesWritten;
+
+	WSAOVERLAPPED sendOverlap;
 	CHAR sendBuf[BUFSIZE];
 	DWORD bytesSend;
 	DWORD bytesSent;
+
+	WSAOVERLAPPED recvOverlap;
 	CHAR recvBuf[BUFSIZE];
 	DWORD bytesRecv;
-
-	INT16 retry;
-
-	CALLBACKPARAM param1;
-	CALLBACKPARAM param2;
 } CONNINST, *LPCONNINST;
+
+CONNINST gInstances[INSTANCES];
+DWORD nextInstance = 0;
 
 BOOL CreatePipeServer();
 BOOL CreateAndConnectInstance(LPOVERLAPPED aOverlapped, LPHANDLE aPipe);
@@ -65,46 +46,37 @@ void WriteComplete(LPCONNINST inst);
 void SendComplete(LPCONNINST inst);
 void RecvComplete(LPCONNINST inst);
 
+IOCenter io;
+
 void ReadComplete(LPCONNINST inst)
 {
-	//HexPrint("ReadComplete:", inst->readBuf, inst->bytesRead);
-
-	if (inst->bytesRead == 0) {
-		if (inst->retry-- == 0) {
-			dprintf("disconnect\n");
-			DisconnectAndClose(inst);
-			return;
-		}
-	} else {
-		inst->retry = MAXRETRY;
-	}
+	HexPrint("ReadComplete:", inst->readBuf, inst->bytesRead);
 
 	memcpy(inst->sendBuf, inst->readBuf, inst->bytesRead);
 	inst->bytesSend = inst->bytesRead;
 	inst->bytesSent = 0;
 
-	memset(inst->readBuf, 0, sizeof(inst->readBuf));
+	memset(inst->readBuf, 0x1C, sizeof(inst->readBuf));
 	inst->bytesRead = 0;
 
-	inst->proxy->Send(inst->sendBuf, inst->bytesSend);
+	inst->proxy->Send(inst->sendBuf, inst->bytesSend, &inst->sendOverlap);
 }
 
 void WriteComplete(LPCONNINST inst)
 {
-	//HexPrint("WriteComplete:", inst->writeBuf, inst->bytesWritten);
+	HexPrint("WriteComplete:", inst->writeBuf, inst->bytesWritten);
 
-	memset(inst->writeBuf, 0, sizeof(inst->writeBuf));
+	memset(inst->writeBuf, 0x1C, sizeof(inst->writeBuf));
 	inst->bytesWrite = inst->bytesWritten = 0;
 
-	inst->proxy->Recv(inst->recvBuf, sizeof(inst->recvBuf), &inst->bytesRecv);
+	inst->proxy->Recv(inst->recvBuf, sizeof(inst->recvBuf), &inst->bytesRecv, &inst->recvOverlap);
 }
 
 void SendComplete(LPCONNINST inst)
 {
-	//HexPrint("SendComplete:", inst->sendBuf, inst->bytesSent);
-	inst->proxy->ResetSend();
+	HexPrint("SendComplete:", inst->sendBuf, inst->bytesSent);
 
-	memset(inst->sendBuf, 0, sizeof(inst->sendBuf));
+	memset(inst->sendBuf, 0x1C, sizeof(inst->sendBuf));
 	inst->bytesSend = inst->bytesSent = 0;
 
 	ReadFile(inst->pipe, inst->readBuf, sizeof(inst->readBuf), &inst->bytesRead, &inst->readOverlap);
@@ -112,207 +84,113 @@ void SendComplete(LPCONNINST inst)
 
 void RecvComplete(LPCONNINST inst)
 {
-	//HexPrint("RecvComplete:", inst->recvBuf, inst->bytesRecv);
-	inst->proxy->ResetRecv();
-
-	if (inst->bytesRecv == 0) {
-		if (inst->retry-- == 0) {
-			dprintf("disconnect\n");
-			DisconnectAndClose(inst);
-			return;
-		}
-	} else {
-		inst->retry = MAXRETRY;
-	}
+	HexPrint("RecvComplete:", inst->recvBuf, inst->bytesRecv);
 
 	memcpy(inst->writeBuf, inst->recvBuf, inst->bytesRecv);
 	inst->bytesWrite = inst->bytesRecv;
 	inst->bytesWritten = 0;
 
-	memset(inst->recvBuf, 0, sizeof(inst->recvBuf));
+	memset(inst->recvBuf, 0x1C, sizeof(inst->recvBuf));
 	inst->bytesRecv = 0;
 
 	WriteFile(inst->pipe, inst->writeBuf, inst->bytesWrite, &inst->bytesWritten, &inst->writeOverlap);
 }
 
-void PipeCallback(LPCONNINST aInst, DWORD aBytesTransferred)
+void IoCallback(ULONG_PTR ptr, DWORD aBytesTransferred, LPVOID aOverlapped)
 {
-	HANDLE pipe = aInst->pipe;
-
-	if (!pipe) {
-		return;
-	}
-
-	//dprintf("%s: aInst=%p, proxy=%p pipe=%p, aBytesTransferred=%d\n", __func__, aInst, aInst->proxy, aInst->pipe, aBytesTransferred);
-
-	DWORD readEvent = WaitForSingleObject(aInst->readOverlap.hEvent, 0);
-	DWORD writeEvent = WaitForSingleObject(aInst->writeOverlap.hEvent, 0);
-	BOOL isRead = writeEvent != WAIT_OBJECT_0;
-	BOOL isWritten = readEvent != WAIT_OBJECT_0;
-
-	int counter = MAXRETRY;
-	while (isRead && isWritten) { // nothing is complete
-		// impossible, why this function called?
-		dprintf("PipeCallback ERROR!\n");
-		if (counter-- > 0) {
-			readEvent = WaitForSingleObject(aInst->readOverlap.hEvent, RETRY_WAIT);
-			writeEvent = WaitForSingleObject(aInst->writeOverlap.hEvent, RETRY_WAIT);
-			isRead = writeEvent != WAIT_OBJECT_0;
-			isWritten = readEvent != WAIT_OBJECT_0;
-		}
-		else {
-			DisconnectAndClose(aInst);
-			return;
-		}
-	}
-
-	BOOL successRead = FALSE, successWrite = FALSE;
-	DWORD bytesTransferred = 0;
-	if (readEvent == WAIT_OBJECT_0) { // read complete
-		successRead = GetOverlappedResult(pipe, &aInst->readOverlap, &bytesTransferred, FALSE);
-		if (!successRead) {
-			dprintf("GetOverlappedResult (read) failed, errno=%d\n", GetLastError());
-		} else {
-			aInst->bytesRead = bytesTransferred;
-		}
-	}
-	if (writeEvent == WAIT_OBJECT_0) { // write complete
-		successWrite = GetOverlappedResult(pipe, &aInst->writeOverlap, &bytesTransferred, FALSE);
-		if (!successWrite) {
-			dprintf("GetOverlappedResult (write) failed, errno=%d\n", GetLastError());
-		} else {
-			aInst->bytesWritten = bytesTransferred;
-		}
-	}
-
-	if (!isRead && !isWritten) { // both are complete
-		if (aInst->bytesRead == aInst->bytesWritten &&
-			aInst->bytesRead == aBytesTransferred) {
-			// equal, doesn't matter, choose recv
-			isRead = TRUE;
-		}
-		else if (aInst->bytesWritten == aBytesTransferred) {
-			isWritten = TRUE;
-		}
-		else if (aInst->bytesRead == aBytesTransferred) {
-			isRead = TRUE;
-		}
-		else {
-			// error, report below.
-		}
-	}
-
-	if (isRead) {
-		dprintf("[PipeCallback] Read %s (arg=%d, chk=%d)\n", successRead ? "success" : "failed", aBytesTransferred, aInst->bytesRead);
-		ReadComplete(aInst);
-	}
-	else if (isWritten) {
-		dprintf("[PipeCallback] Write %s (arg=%d, chk=%d, exp=%d)\n", successWrite ? "success" : "failed", aBytesTransferred, aInst->bytesWritten, aInst->bytesWrite);
-		WriteComplete(aInst);
-	}
-	else {
-		dprintf("ERROR! readEvent=%d, writeEvent=%d\n", readEvent, writeEvent);
-		dprintf("ERROR! tr=%d readEvent=%d (%d), writeEvent=%d (%d, %d)\n",
-			aBytesTransferred, readEvent, aInst->bytesRead, writeEvent, aInst->bytesWrite, aInst->bytesWritten);
-	}
-}
-
-void SockCallback(LPCONNINST aInst, DWORD aBytesTransferred)
-{
-	LPPROXY proxy = aInst->proxy;
-
-	if (!proxy) {
-		return;
-	}
-
-	//dprintf("%s: aInst=%p, proxy=%p pipe=%p, aBytesTransferred=%d\n", __func__, aInst, aInst->proxy, aInst->pipe, aBytesTransferred);
-
-	BOOL isSent = !proxy->RecvComplete();
-	BOOL isRecv = !proxy->SendComplete();
-
-	int counter = MAXRETRY;
-	while (isSent && isRecv) { // nothing is complete
-		// impossible, why this function called?
-		dprintf("SockCallback ERROR!\n");
-		
-		if (counter-- > 0) {
-			isSent = !proxy->RecvComplete(RETRY_WAIT);
-			isRecv = !proxy->SendComplete(RETRY_WAIT);
-		} else {
-			DisconnectAndClose(aInst);
-			return;
-		}
-	}
-
-	BOOL successSend = FALSE, successRecv = FALSE;
-	if (proxy->SendComplete()) {
-		successSend = proxy->UpdateSendResult();
-		if (!successSend) {
-			dprintf("UpdateSendResult failed\n");
-		}
-		else {
-			aInst->bytesSent = proxy->BytesSent();
-		}
-	}
-
-	if (proxy->RecvComplete()) {
-		successRecv = proxy->UpdateRecvResult();
-		if (!successRecv) {
-			dprintf("UpdateRecvResult failed\n");
-		} else {
-			aInst->bytesRecv = proxy->BytesRecv();
-		}
-	}
-
-	if (!isSent && !isRecv) { // both are complete
-		if (aInst->bytesSent == aInst->bytesRecv &&
-			aInst->bytesSent == aBytesTransferred) {
-			// equal, doesn't matter, choose recv
-			isRecv = TRUE;
-		} else if (aInst->bytesSent == aBytesTransferred) {
-			isSent = TRUE;
-		} else if (aInst->bytesRecv == aBytesTransferred) {
-			isRecv = TRUE;
-		} else {
-			// error, report below.
-		}
-	}
-
-	if (isSent) {
-		dprintf("[SockCallback] Send %s (arg=%d, get=%d, exp=%d)\n", successSend ? "success" : "failed", aBytesTransferred, proxy->BytesSent(), proxy->BytesSend());
-		SendComplete(aInst);
-	}
-	else if (isRecv) {
-		dprintf("[SockCallback] Recv %s (arg=%d, get=%d)\n", successRecv ? "success" : "failed", aBytesTransferred, proxy->BytesRecv());
-		RecvComplete(aInst);
-	} else {
-		dprintf("ERROR! tr=%d SendComplete=%d (%d, %d, %d), RecvComplete=%d (%d)\n",
-			aBytesTransferred, proxy->SendComplete(), aInst->bytesSend, proxy->BytesSent(), proxy->BytesSend(),
-			proxy->RecvComplete(), proxy->BytesRecv());
-	}
-}
-
-void IoCallback(ULONG_PTR ptr, DWORD aBytesTransferred)
-{
-	LPCALLBACKPARAM param = (LPCALLBACKPARAM)ptr;
-	if (!param || !param->inst) {
+	LPCONNINST inst = (LPCONNINST)ptr;
+	if (!inst || !inst->pipe || !inst->proxy) {
 		return;
 	}
 
 	if (aBytesTransferred == (DWORD)-1) {
-		DisconnectAndClose(param->inst);
+		DisconnectAndClose(inst);
 		return;
 	}
 
-	switch (param->type) {
-	case ePipe:
-		PipeCallback(param->inst, aBytesTransferred);
-		break;
-	case eSock:
-		SockCallback(param->inst, aBytesTransferred);
-		break;
-	default:
-		dprintf("Ohhhhhh!!!!");
+	BOOL success = FALSE;
+	DWORD bytesTransferred = 0;
+	if (aOverlapped == (LPVOID)(&inst->readOverlap)) {
+		success = GetOverlappedResult(inst->pipe, &inst->readOverlap, &bytesTransferred, FALSE);
+		if (success) {
+			_ASSERTE(aBytesTransferred == bytesTransferred);
+			inst->bytesRead = bytesTransferred;
+			ReadComplete(inst);
+		} else {
+			dprintf("GetOverlapped Result failed (%d)\n", GetLastError());
+		}
+	} else if (aOverlapped == (LPVOID)(&inst->writeOverlap)) {
+		success = GetOverlappedResult(inst->pipe, &inst->writeOverlap, &bytesTransferred, FALSE);
+		if (success) {
+			_ASSERTE(aBytesTransferred == bytesTransferred);
+			inst->bytesWritten = bytesTransferred;
+			_ASSERTE(inst->bytesWrite == inst->bytesWritten);
+			WriteComplete(inst);
+		} else {
+			dprintf("GetOverlapped Result failed (%d)\n", GetLastError());
+		}
+	} else if (aOverlapped == (LPVOID)(&inst->sendOverlap)) {
+		success = SUCCEEDED(inst->proxy->GetOverlappedResult(&inst->sendOverlap, &bytesTransferred, FALSE));
+		if (success) {
+			_ASSERTE(aBytesTransferred == bytesTransferred);
+			inst->bytesSent = bytesTransferred;
+			_ASSERTE(inst->bytesSend == inst->bytesSent);
+			SendComplete(inst);
+		} else {
+			dprintf("GetOverlapped Result failed (%d)\n", WSAGetLastError());
+		}
+	} else if (aOverlapped == (LPVOID)(&inst->recvOverlap)) {
+		success = SUCCEEDED(inst->proxy->GetOverlappedResult(&inst->recvOverlap, &bytesTransferred, FALSE));
+		if (success) {
+			_ASSERTE(aBytesTransferred == bytesTransferred);
+			inst->bytesRecv = bytesTransferred;
+			RecvComplete(inst);
+		} else {
+			dprintf("GetOverlapped Result failed (%d)\n", WSAGetLastError());
+		}
+	}
+	else {
+		_ASSERTE("How do you turn this on?");
+	}
+}
+
+static void StartProxy(HANDLE aPipe, IOCenter& aIo)
+{
+	LPCONNINST pipeInst = nullptr;
+	for (int i = 0; i < INSTANCES; ++i) {
+		DWORD index = (nextInstance + i) % INSTANCES;
+		if (gInstances[index].closed) {
+			pipeInst = &gInstances[index];
+			pipeInst->closed = FALSE;
+			break;
+		}
+	}
+	if (!pipeInst) {
+		dprintf("GlobalAlloc failed [%d]\n", GetLastError());
+		return;
+	}
+
+	SecureZeroMemory(pipeInst, sizeof(CONNINST));
+
+	pipeInst->pipe = aPipe;
+	pipeInst->proxy = new Proxy();
+
+	if (FAILED(pipeInst->proxy->Connect("127.0.0.1", "9050"))) {
+		dprintf("Connect failed\n");
+		DisconnectAndClose(pipeInst);
+	}
+	else {
+		dprintf("[%p] new client connected\n", pipeInst->proxy);
+
+		pipeInst->readOverlap.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, "readOverlap");
+		pipeInst->writeOverlap.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, "writeOverlap");
+		pipeInst->sendOverlap.hEvent = WSACreateEvent();
+		pipeInst->recvOverlap.hEvent = WSACreateEvent();
+
+		IOCenter::StartFunction startRead = std::bind(SendComplete, pipeInst);
+		aIo.AddObserver(pipeInst->pipe, startRead, (ULONG_PTR)pipeInst);
+		IOCenter::StartFunction startRecv = std::bind(WriteComplete, pipeInst);
+		aIo.AddObserver((HANDLE)pipeInst->proxy->GetSocket(), startRecv, (ULONG_PTR)pipeInst);
 	}
 }
 
@@ -326,13 +204,16 @@ BOOL CreatePipeServer()
 		return FALSE;
 	}
 
+	for (int i = 0; i < INSTANCES; ++i) {
+		gInstances[i].closed = TRUE;
+	}
+
 	OVERLAPPED oConnect;
 	oConnect.hEvent = connectEvent;
 
 	HANDLE hPipe;
 	BOOL hasPendingIO = CreateAndConnectInstance(&oConnect, &hPipe);
 
-	IOCenter io;
 	io.SetCallback(&IoCallback);
 
 	while (TRUE) {
@@ -346,40 +227,7 @@ BOOL CreatePipeServer()
 				}
 			}
 
-			LPCONNINST pipeInst;
-			pipeInst = (LPCONNINST)GlobalAlloc(GPTR, sizeof(CONNINST));
-			if (!pipeInst) {
-				dprintf("GlobalAlloc failed [%d]\n", GetLastError());
-				return FALSE;
-			}
-
-			pipeInst->retry = MAXRETRY;
-			pipeInst->pipe = hPipe;
-			pipeInst->proxy = new Proxy();
-			if (FAILED(pipeInst->proxy->Connect("127.0.0.1", "9050"))) {
-				dprintf("Connect failed\n");
-				delete pipeInst->proxy;
-				pipeInst->proxy = nullptr;
-				DisconnectAndClose(pipeInst);
-			} else {
-				dprintf("[%p] new client connected\n", pipeInst->proxy);
-
-				pipeInst->readOverlap.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, "readOverlap");
-				pipeInst->writeOverlap.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, "writeOverlap");
-
-				pipeInst->requestState = eRead;
-				pipeInst->responseState = eIdle;
-
-				pipeInst->param1.inst = pipeInst;
-				pipeInst->param1.type = ePipe;
-				pipeInst->param2.inst = pipeInst;
-				pipeInst->param2.type = eSock;
-
-				auto startRead = std::bind(ReadFile, pipeInst->pipe, pipeInst->readBuf, static_cast<DWORD>(sizeof(pipeInst->readBuf)), &pipeInst->bytesRead, &pipeInst->readOverlap);
-				io.AddHandle(pipeInst->pipe, startRead, (ULONG_PTR)&pipeInst->param1);
-				auto startRecv = std::bind(&Proxy::Recv, pipeInst->proxy, pipeInst->recvBuf, static_cast<DWORD>(sizeof(pipeInst->recvBuf)), &pipeInst->bytesRecv);
-				io.AddHandle((HANDLE)pipeInst->proxy->GetSocket(), startRecv, (ULONG_PTR)&pipeInst->param2);
-			}
+			StartProxy(hPipe, io);
 
 			hasPendingIO = CreateAndConnectInstance(&oConnect, &hPipe);
 			break;
@@ -453,29 +301,41 @@ BOOL ConnectToNewClient(HANDLE aPipe, LPOVERLAPPED aOverlapped)
 
 VOID DisconnectAndClose(LPCONNINST aPipeInst)
 {
-	if (!aPipeInst)
+	_ASSERTE(aPipeInst);
+	if (aPipeInst->closed) {
 		return;
-
-	dprintf("DisconnectAndClose %p\n", aPipeInst->proxy);
-
-	if (FAILED(aPipeInst->proxy->Disconnect())) {
-		dprintf("Disconnect proxy failed\n");
-	}
-	delete aPipeInst->proxy;
-	aPipeInst->proxy = nullptr;
-
-	aPipeInst->param1.inst = nullptr;
-	aPipeInst->param2.inst = nullptr;
-
-	if (!DisconnectNamedPipe(aPipeInst->pipe)) {
-		dprintf("DisconnectNamedPipe failed [%d]\n", GetLastError());
 	}
 
-	::CloseHandle(aPipeInst->readOverlap.hEvent);
-	::CloseHandle(aPipeInst->writeOverlap.hEvent);
+	aPipeInst->closed = TRUE;
+	dprintf("DisconnectAndClose %p\n", aPipeInst);
 
-	CloseHandle(aPipeInst->pipe);
-	//GlobalFree(aPipeInst);
+	io.RemoveObserver((ULONG_PTR)&aPipeInst);
+	io.RemoveObserver((ULONG_PTR)&aPipeInst);
+
+	if (aPipeInst->proxy) {
+		if (FAILED(aPipeInst->proxy->Disconnect())) {
+			dprintf("Disconnect proxy failed\n");
+		}
+		delete aPipeInst->proxy;
+		aPipeInst->proxy = nullptr;
+	}
+
+	if (aPipeInst->pipe) {
+		if (!::DisconnectNamedPipe(aPipeInst->pipe)) {
+			dprintf("DisconnectNamedPipe failed [%d]\n", GetLastError());
+		}
+		::CloseHandle(aPipeInst->pipe);
+	}
+
+	if (aPipeInst->readOverlap.hEvent) {
+		::CloseHandle(aPipeInst->readOverlap.hEvent);
+		aPipeInst->readOverlap.hEvent = nullptr;
+	}
+
+	if (aPipeInst->writeOverlap.hEvent) {
+		::CloseHandle(aPipeInst->writeOverlap.hEvent);
+		aPipeInst->writeOverlap.hEvent = nullptr;
+	}
 }
 
 HRESULT CreateServer()

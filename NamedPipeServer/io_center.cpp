@@ -8,6 +8,9 @@ IOCenter::IOCenter()
 	: mIocp(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0))
 	, mStopped(false)
 	, mCallback(nullptr)
+	, mLock()
+	, mObservers()
+	, mInitFunctions()
 	, mThread(std::make_unique<std::thread>(std::bind(&IOCenter::ThreadProc, this, mIocp)))
 {
 }
@@ -38,7 +41,7 @@ HRESULT IOCenter::Finalize()
 	return S_OK;
 }
 
-HRESULT IOCenter::AddHandle(HANDLE aHandle, StartFunction aFunc, ULONG_PTR aParam)
+HRESULT IOCenter::AddObserver(HANDLE aHandle, StartFunction aFunc, ULONG_PTR aParam)
 {
 	if (!mIocp || mIocp == INVALID_HANDLE_VALUE) {
 		return E_FAIL;
@@ -53,10 +56,21 @@ HRESULT IOCenter::AddHandle(HANDLE aHandle, StartFunction aFunc, ULONG_PTR aPara
 		return E_UNEXPECTED;
 	}
 
-	if (aFunc) {
-		aFunc();
+	{
+		std::lock_guard<std::mutex> g(mLock);
+		mObservers.insert(aParam);
+		if (aFunc) {
+			mInitFunctions.push_back(aFunc);
+		}
 	}
 
+	return S_OK;
+}
+
+HRESULT IOCenter::RemoveObserver(ULONG_PTR aParam)
+{
+	std::lock_guard<std::mutex> g(mLock);
+	mObservers.erase(aParam);
 	return S_OK;
 }
 
@@ -71,35 +85,45 @@ void IOCenter::ThreadProc(HANDLE aIocp)
 {
 	DWORD bytesTransferred = 0;
 	ULONG_PTR ptr = 0;
-	LPOVERLAPPED overlap = {};
+	LPOVERLAPPED overlap = nullptr;
 	BOOL ret = FALSE;
+	BOOL valid = FALSE;
 
 	while (!mStopped) {
-		ret = GetQueuedCompletionStatus(aIocp, &bytesTransferred, &ptr, &overlap, 1000);
+		while (true) {
+			std::unique_lock<std::mutex> g(mLock);
+			if (mInitFunctions.empty()) {
+				break;
+			}
+
+			StartFunction func = mInitFunctions.front();
+			mInitFunctions.pop_front();
+			g.unlock();
+
+			func();
+		}
+		{
+			ret = GetQueuedCompletionStatus(aIocp, &bytesTransferred, &ptr, &overlap, 1000);
+			std::lock_guard<std::mutex> g(mLock);
+			valid = mObservers.find(ptr) != mObservers.end();
+		}
+
 		if (ret) {
-			if (bytesTransferred) {
-				//dprintf("[%s][%p] bytesTransferred = %d\n", __func__, ptr, bytesTransferred);
+			if (valid && mCallback) {
+				mCallback(ptr, bytesTransferred, overlap);
 			}
-			if (mCallback) {
-				mCallback(ptr, bytesTransferred);
+			continue;
+		}
+
+		switch (GetLastError()) {
+		case WAIT_TIMEOUT:
+			continue;
+		default:
+			if (valid && mCallback) {
+				dprintf("[ThreadProc] GetQueuedCompletionStatus error (%d)\n", GetLastError());
+				mCallback(ptr, (DWORD)-1, overlap);
 			}
-		} else {
-			switch (GetLastError()) {
-			case ERROR_BROKEN_PIPE:
-			case ERROR_PIPE_NOT_CONNECTED:
-				if (mCallback) {
-					mCallback(ptr, (DWORD)-1);
-				}
-				break;
-			case ERROR_OPERATION_ABORTED:
-				dprintf("connection closed\n");
-				break;
-			case WAIT_TIMEOUT:
-				continue;
-			default:
-				dprintf("GetQueuedCompletionStatus error (%d)\n", GetLastError());
-				break;
-			}
+			break;
 		}
 	}
 }

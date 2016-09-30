@@ -7,20 +7,14 @@
 
 Proxy::Proxy()
 {
-	SecureZeroMemory(&mSendOverlap, sizeof(WSAOVERLAPPED));
-	SecureZeroMemory(&mRecvOverlap, sizeof(WSAOVERLAPPED));
-	mSendOverlap.hEvent = WSACreateEvent();
-	mRecvOverlap.hEvent = WSACreateEvent();
-	WSASetEvent(mSendOverlap.hEvent);
-	WSASetEvent(mRecvOverlap.hEvent);
 }
 
 Proxy::~Proxy()
 {
-	Reset();
+	Disconnect();
 }
 
-HRESULT WaitConnect(SOCKET s)
+static HRESULT WaitConnect(SOCKET s)
 {
 	WSAEVENT e = WSACreateEvent();
 	if (e == WSA_INVALID_EVENT) {
@@ -147,7 +141,7 @@ HRESULT Proxy::Connect(LPCSTR aHost, LPCSTR aPort)
 
 HRESULT Proxy::Disconnect()
 {
-	if (mSocket == INVALID_SOCKET)
+	if (!mSocket || mSocket == INVALID_SOCKET)
 		return S_FALSE;
 
 	int iResult = shutdown(mSocket, SD_BOTH);
@@ -155,106 +149,64 @@ HRESULT Proxy::Disconnect()
 		dprintf("shutdown failed [%d]\n", WSAGetLastError());
 	}
 
-	return Reset();
+	closesocket(mSocket);
+	mSocket = INVALID_SOCKET;
+
+	return S_OK;
 }
 
-HRESULT Proxy::Send(LPVOID aBuffer, DWORD aBufferSize)
+HRESULT Proxy::Send(LPVOID aBuffer, DWORD aBufferSize, LPWSAOVERLAPPED aOverlapped)
 {
 	if (mSocket == INVALID_SOCKET)
 		return E_FAIL;
 
-	memcpy(mSendBuf, aBuffer, aBufferSize);
-	mBytesToSend = aBufferSize;
 	WSABUF buf;
-	buf.buf = mSendBuf;
-	buf.len = mBytesToSend;
-	int err = WSASend(mSocket, &buf, 1, &mBytesSent, 0, &mSendOverlap, nullptr);
+	buf.buf = (CHAR*)aBuffer;
+	buf.len = aBufferSize;
+
+	DWORD bytesSent = 0;
+	int err = WSASend(mSocket, &buf, 1, &bytesSent, 0, aOverlapped, nullptr);
 	if (err && WSAGetLastError() != WSA_IO_PENDING) {
 		dprintf("WSASend failed [%d]\n", WSAGetLastError());
 		Disconnect();
 		return E_FAIL;
 	}
-	DWORD flags = 0;
-	if (!WSAGetOverlappedResult(mSocket, &mSendOverlap, &mBytesSent, TRUE, &flags)) {
-		return E_FAIL;
-	}
-	//dprintf("[%p] Sending %d bytes, %d bytes sent\n", this, mBytesToSend, mBytesSent);
-	//HexPrint("SEND:", aBuffer, mBytesSent);
+
 	return S_OK;
 }
 
-HRESULT Proxy::Recv(LPVOID aBuffer, DWORD aBufferSize, LPDWORD aBytesReceived)
+HRESULT Proxy::Recv(LPVOID aBuffer, DWORD aBufferSize, LPDWORD aBytesReceived, LPWSAOVERLAPPED aOverlapped)
 {
 	if (!aBytesReceived)
 		return E_POINTER;
 	if (mSocket == INVALID_SOCKET)
 		return E_FAIL;
 
-	mRecvBuf = aBuffer;
-
 	WSABUF buf;
 	DWORD flags = 0;
 	buf.buf = (CHAR*)aBuffer;
 	buf.len = aBufferSize;
-	int err = WSARecv(mSocket, &buf, 1, aBytesReceived, &flags, &mRecvOverlap, nullptr);
+
+	int err = WSARecv(mSocket, &buf, 1, aBytesReceived, &flags, aOverlapped, nullptr);
 	if (err && WSAGetLastError() != WSA_IO_PENDING) {
 		dprintf("WSARecv failed [%d]\n", WSAGetLastError());
 		Disconnect();
 		return E_FAIL;
 	}
 
-	DWORD bytesReceived = 0;
-	if (!WSAGetOverlappedResult(mSocket, &mRecvOverlap, &bytesReceived, FALSE, &flags)) {
-		if (WSAGetLastError() == WSA_IO_INCOMPLETE) {
-			return S_FALSE;
-		}
-		dprintf("WSAGetOverlappedResult() failed [%d]\n", WSAGetLastError());
-		return E_FAIL;
-	}
-
-	*aBytesReceived = mBytesRecv = bytesReceived;
-	if (mBytesRecv) {
-		//dprintf("[%p] Receiving %d bytes\n", this, *aBytesReceived);
-		//HexPrint("RECV:", aBuffer, *aBytesReceived);
-	}
 	return S_OK;
 }
 
-BOOL Proxy::UpdateSendResult()
-{
-	return SendComplete();
-}
-
-BOOL Proxy::UpdateRecvResult()
+HRESULT Proxy::GetOverlappedResult(LPWSAOVERLAPPED aOverlapped, LPDWORD aBytesTransfered, BOOL aWait)
 {
 	DWORD flags = 0;
-	DWORD bytesReceived = 0;
-	if (!WSAGetOverlappedResult(mSocket, &mRecvOverlap, &bytesReceived, FALSE, &flags)) {
-		dprintf("WSAGetOverlappedResult() failed [%d]\n", WSAGetLastError());
-		return FALSE;
+	if (!WSAGetOverlappedResult(mSocket, aOverlapped, aBytesTransfered, aWait, &flags)) {
+		if (WSAGetLastError() == WSA_IO_INCOMPLETE) {
+			return S_FALSE;
+		}
+		return E_FAIL;
 	}
-	mBytesRecv = bytesReceived;
-	if (mBytesRecv) {
-		//dprintf("[%p] Receiving %d bytes\n", this, bytesReceived);
-		//HexPrint("RECV:", mRecvBuf, bytesReceived);
-	}
-	return TRUE;
-}
-
-HRESULT Proxy::Reset()
-{
-	if (mSocket != INVALID_SOCKET) {
-		closesocket(mSocket);
-		mSocket = INVALID_SOCKET;
-	}
-	if (mSendOverlap.hEvent) {
-		WSACloseEvent(mSendOverlap.hEvent);
-		mSendOverlap.hEvent = nullptr;
-	}
-	if (mRecvOverlap.hEvent) {
-		WSACloseEvent(mRecvOverlap.hEvent);
-		mRecvOverlap.hEvent = nullptr;
-	}
+	dprintf("[Proxy::GetOverlappedResult] %d bytes transferred\n", *aBytesTransfered);
 	return S_OK;
 }
 

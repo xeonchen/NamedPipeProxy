@@ -12,7 +12,7 @@ int main()
 		return -1;
 	}
 
-	//RunTests();
+	// RunTests();
 	CreateServer();
 
 	WSACleanup();

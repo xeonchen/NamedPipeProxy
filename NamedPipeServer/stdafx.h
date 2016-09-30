@@ -15,9 +15,11 @@
 
 #include <atomic>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include <WinSock2.h>
