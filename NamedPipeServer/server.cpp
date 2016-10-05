@@ -50,6 +50,10 @@ IOCenter io;
 
 void ReadComplete(LPCONNINST inst)
 {
+	if (inst->closed) {
+		return;
+	}
+
 	HexPrint("ReadComplete:", inst->readBuf, inst->bytesRead);
 
 	memcpy(inst->sendBuf, inst->readBuf, inst->bytesRead);
@@ -59,31 +63,49 @@ void ReadComplete(LPCONNINST inst)
 	memset(inst->readBuf, 0x1C, sizeof(inst->readBuf));
 	inst->bytesRead = 0;
 
-	inst->proxy->Send(inst->sendBuf, inst->bytesSend, &inst->sendOverlap);
+	if (inst->proxy) {
+		inst->proxy->Send(inst->sendBuf, inst->bytesSend, &inst->sendOverlap);
+	}
 }
 
 void WriteComplete(LPCONNINST inst)
 {
+	if (inst->closed) {
+		return;
+	}
+
 	HexPrint("WriteComplete:", inst->writeBuf, inst->bytesWritten);
 
 	memset(inst->writeBuf, 0x1C, sizeof(inst->writeBuf));
 	inst->bytesWrite = inst->bytesWritten = 0;
 
-	inst->proxy->Recv(inst->recvBuf, sizeof(inst->recvBuf), &inst->bytesRecv, &inst->recvOverlap);
+	if (inst->proxy) {
+		inst->proxy->Recv(inst->recvBuf, sizeof(inst->recvBuf), &inst->bytesRecv, &inst->recvOverlap);
+	}
 }
 
 void SendComplete(LPCONNINST inst)
 {
+	if (inst->closed) {
+		return;
+	}
+
 	HexPrint("SendComplete:", inst->sendBuf, inst->bytesSent);
 
 	memset(inst->sendBuf, 0x1C, sizeof(inst->sendBuf));
 	inst->bytesSend = inst->bytesSent = 0;
 
-	ReadFile(inst->pipe, inst->readBuf, sizeof(inst->readBuf), &inst->bytesRead, &inst->readOverlap);
+	if (inst->pipe) {
+		ReadFile(inst->pipe, inst->readBuf, sizeof(inst->readBuf), &inst->bytesRead, &inst->readOverlap);
+	}
 }
 
 void RecvComplete(LPCONNINST inst)
 {
+	if (inst->closed) {
+		return;
+	}
+
 	HexPrint("RecvComplete:", inst->recvBuf, inst->bytesRecv);
 
 	memcpy(inst->writeBuf, inst->recvBuf, inst->bytesRecv);
@@ -93,13 +115,15 @@ void RecvComplete(LPCONNINST inst)
 	memset(inst->recvBuf, 0x1C, sizeof(inst->recvBuf));
 	inst->bytesRecv = 0;
 
-	WriteFile(inst->pipe, inst->writeBuf, inst->bytesWrite, &inst->bytesWritten, &inst->writeOverlap);
+	if (inst->pipe) {
+		WriteFile(inst->pipe, inst->writeBuf, inst->bytesWrite, &inst->bytesWritten, &inst->writeOverlap);
+	}
 }
 
 void IoCallback(ULONG_PTR ptr, DWORD aBytesTransferred, LPVOID aOverlapped)
 {
 	LPCONNINST inst = (LPCONNINST)ptr;
-	if (!inst || !inst->pipe || !inst->proxy) {
+	if (!inst || !inst->pipe || !inst->proxy || inst->closed) {
 		return;
 	}
 
@@ -252,6 +276,12 @@ BOOL CreateAndConnectInstance(LPOVERLAPPED aOverlapped, LPHANDLE aPipe)
 		return FALSE;
 	}
 
+	SECURITY_ATTRIBUTES attr;
+	SecureZeroMemory(&attr, sizeof(SECURITY_ATTRIBUTES));
+	attr.nLength = sizeof(SECURITY_ATTRIBUTES);
+	attr.bInheritHandle = TRUE;
+	attr.lpSecurityDescriptor = nullptr;
+
 	// FIXME: adjust parameters
 	*aPipe = CreateNamedPipeA(
 		PIPE_NAME,
@@ -264,7 +294,7 @@ BOOL CreateAndConnectInstance(LPOVERLAPPED aOverlapped, LPHANDLE aPipe)
 		BUFSIZE,
 		BUFSIZE,
 		PIPE_TIMEOUT,
-		NULL);
+		&attr);
 
 	if (*aPipe == INVALID_HANDLE_VALUE) {
 		dprintf("CreateNamedPipe failed [%d]\n", GetLastError());
