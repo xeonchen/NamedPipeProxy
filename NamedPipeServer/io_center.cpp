@@ -5,7 +5,7 @@
 
 
 IOCenter::IOCenter()
-	: mIocp(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0))
+	: mIocp(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1))
 	, mStopped(false)
 	, mCallback(nullptr)
 	, mLock()
@@ -50,7 +50,7 @@ HRESULT IOCenter::AddObserver(HANDLE aHandle, StartFunction aFunc, ULONG_PTR aPa
 		return E_INVALIDARG;
 	}
 
-	HANDLE h = ::CreateIoCompletionPort(aHandle, mIocp, aParam, 0);
+	HANDLE h = ::CreateIoCompletionPort(aHandle, mIocp, aParam, 1);
 	if (h != mIocp) {
 		::CloseHandle(h);
 		return E_UNEXPECTED;

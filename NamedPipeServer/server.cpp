@@ -127,7 +127,8 @@ void IoCallback(ULONG_PTR ptr, DWORD aBytesTransferred, LPVOID aOverlapped)
 		return;
 	}
 
-	if (aBytesTransferred == (DWORD)-1) {
+	if (aBytesTransferred == (DWORD)-1 || aBytesTransferred == 0) {
+		// disconnect when error or closed
 		DisconnectAndClose(inst);
 		return;
 	}
@@ -176,6 +177,8 @@ void IoCallback(ULONG_PTR ptr, DWORD aBytesTransferred, LPVOID aOverlapped)
 	else {
 		_ASSERTE("How do you turn this on?");
 	}
+
+	_ASSERTE(bytesTransferred == aBytesTransferred);
 }
 
 static void StartProxy(HANDLE aPipe, IOCenter& aIo)

@@ -206,7 +206,7 @@ HRESULT Proxy::GetOverlappedResult(LPWSAOVERLAPPED aOverlapped, LPDWORD aBytesTr
 		}
 		return E_FAIL;
 	}
-	dprintf("[Proxy::GetOverlappedResult] %d bytes transferred\n", *aBytesTransfered);
+	dprintf("[Proxy::GetOverlappedResult] %d bytes transferred (%p)\n", *aBytesTransfered, aOverlapped);
 	return S_OK;
 }
 
